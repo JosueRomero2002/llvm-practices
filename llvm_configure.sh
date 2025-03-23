@@ -52,17 +52,50 @@ function find_llvm_tools() {
     done
 }
 
-function find_libc() {
-    local libc_path=$(ldd /bin/sh | awk '/libc\.so/ { print $3 }')
+function find_gnu_libc() {
+    local crti_path=$(find /usr -name "crti.o" 2>/dev/null | grep -v musl)
 
-    if [[ -n "$libc_path" ]]; then
-        echo -n $(dirname "$libc_path")
+    if [[ -n "$crti_path" ]]; then
+        dirname "$crti_path"
     else
         echo -n
     fi
 }
 
+function find_musl_libc() {
+    local crti_path=$(find /usr -name "crti.o" 2>/dev/null | grep musl)
+
+    if [[ -n "$crti_path" ]]; then
+        dirname "$crti_path"
+    else
+        echo -n
+    fi
+}
+
+function check_object_files() {
+    local lic_path="$1"
+    local obj_files="crt1.o crti.o crtn.o"
+
+    for obj in $obj_files; do
+        if [ ! -f "$lic_path/$obj" ]; then
+            echo "${RED}Error:${RESET} Object file ${CYAN}$obj${RESET} not found."
+            return 1
+        fi
+    done
+
+    return 0
+}
+
 function build_makefile() {
+    local use_musl=$1
+    local ld_flags="$1"
+
+    if [[ $use_musl == 1 ]]; then
+        local ld_flags="-static -nostdlib"
+    else
+        local ld_flags="-dynamic-linker \$(DYNAMIC_LINKER)"
+    fi
+
 cat << EOF > $BUILD_FOLDER/Makefile
 # LLVM tools and filenames
 LLVM_AS := $LLVM_AS
@@ -93,54 +126,81 @@ all: \$(EXE)
 # Step 3: Link the object file into an executable with the dynamic linker and libc
 \$(EXE): \$(OBJ)
 	\$(LLD) -flavor gnu \\
+		-o \$(EXE) \\
+		$ld_flags \\
 		-L \$(LIBC_DIR) \\
-		-dynamic-linker \$(DYNAMIC_LINKER) \\
-		-lc \\
-		\$(OBJ) -o \$(EXE)
+		\$(LIBC_DIR)/crt1.o \\
+		\$(LIBC_DIR)/crti.o \\
+		\$(OBJ) -lc \\
+		\$(LIBC_DIR)/crtn.o
 
 clean:
 	rm -f \$(BITCODE) \$(OBJ) \$(EXE)
 EOF
 }
 
+#================================================================
+
+VERSION="0.2.0"
+echo "${BLUE}llv_configure${RESET} version ${CYAN}$VERSION${RESET}"
+echo "----------------------------"
+
 # CLI Arguments
 BUILD_FOLDER=""
 SRC_FILENAME=""
+WITH_MUSL=0
 
-while getopts "B:S:" opt; do
-    case "$opt" in
-        B) BUILD_FOLDER="$OPTARG" ;;
-        S) SRC_FILENAME="$OPTARG" ;;
-        ?) echo "Usage: $0 -B <folder> -S <filename>"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -B) shift; BUILD_FOLDER="$1" ;;
+        -S) shift; SRC_FILENAME="$1" ;;
+        --with-musl) WITH_MUSL=1 ;;
+        ?) echo "Usage: $0 [--with-musl] -B <folder> -S <filename>"
            exit 1 ;;
     esac
+    shift
 done
 
 # Ensure both flags were provided
 if [[ -z "$BUILD_FOLDER" || -z "$SRC_FILENAME" ]]; then
     echo "${RED}Error:${RESET} Both -B <folder> and -S <filename> are required."
-    echo "Usage: $0 -B <folder> -S <filename>"
+    echo echo "Usage: $0 [--with-musl] -B <folder> -S <filename>"
     exit 1
 fi
 
 ABORT_CONFIGURE=false
 
-LIBC_DIR=$(find_libc)
+if [[ $WITH_MUSL == 1 ]]; then
+    LIBC_DIR=$(find_musl_libc)
 
-if [[ -z $LIBC_DIR ]]; then
-    echo "${RED}Error:${RESET} Cannot find standard C library"
-    ABORT_CONFIGURE=true
+    if [[ -z $LIBC_DIR ]]; then
+        echo "${RED}Error:${RESET} Cannot find MUSL C library"
+        ABORT_CONFIGURE=true
+    else
+        echo "Found MUSL C library at ${CYAN}$LIBC_DIR${RESET}"
+    fi
 else
-    echo "Found standard C library at ${CYAN}$LIBC_DIR${RESET}"
+    LIBC_DIR=$(find_gnu_libc)
+
+    if [[ -z $LIBC_DIR ]]; then
+        echo "${RED}Error:${RESET} Cannot find standard C library"
+        ABORT_CONFIGURE=true
+    else
+        echo "Found standard C library at ${CYAN}$LIBC_DIR${RESET}"
+    fi
+
+    DYN_LINKER_PATH=$(ldd /bin/sh | awk '/ld-linux-x86-64\.so\.2/ { print $1 }')
+
+    if [[ -z $DYN_LINKER_PATH ]]; then
+        echo "${RED}Error:${RESET} Cannot find linux dynamic linker"
+        ABORT_CONFIGURE=true
+    else
+        echo "Found Linux dynamic linker at ${CYAN}$DYN_LINKER_PATH${RESET}"
+    fi
 fi
 
-DYN_LINKER_PATH=$(ldd /bin/sh | awk '/ld-linux-x86-64\.so\.2/ { print $1 }')
-
-if [[ -z $DYN_LINKER_PATH ]]; then
-    echo "${RED}Error:${RESET} Cannot find linux dynamic linker"
-    ABORT_CONFIGURE=true
-else
-    echo "Found Linux dynamic linker at ${CYAN}$DYN_LINKER_PATH${RESET}"
+if ! check_object_files $LIBC_DIR; then
+    exit 1
 fi
 
 find_llvm_tools
@@ -179,7 +239,7 @@ BC_FILE="${EXE_FILE}.bc"
 
 echo -n "Generating Makefile in folder ${CYAN}$BUILD_FOLDER${RESET} "
 
-build_makefile
+build_makefile $WITH_MUSL
 
 echo "${GREEN}done${RESET} ..."
 
